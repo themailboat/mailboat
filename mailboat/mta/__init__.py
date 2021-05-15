@@ -1,104 +1,32 @@
+"""The reusable programmatic mail transfer agent for Mailboat: `TransferAgent`.
+"""
 import asyncio
 import email.policy
+import logging
 from asyncio import Future
+from asyncio.locks import Lock
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import dataclass
 from email.headerregistry import BaseHeader
 from email.message import EmailMessage
 from email.parser import Parser
-import logging
-from time import perf_counter
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple, cast
-import aiosmtplib
-import aiosmtpd
+from typing import Dict, List, Optional, Tuple, cast
 
+import aiosmtplib
 from aiosmtpd.controller import Controller
-from aiosmtpd.handlers import AsyncMessage
-from aiosmtpd.smtp import AuthResult, Envelope, LoginPassword, SMTP, Session
+from aiosmtpd.smtp import AuthResult
 from aiosmtplib.errors import SMTPAuthenticationError
 from flanker.addresslib import address
 from unqlite import Collection, UnQLite
 
-from asyncio.locks import Lock
-
-from base64 import standard_b64decode, standard_b64encode
-
-from .utils.perf import async_perf_point
-
-LocalDeliveryHandler = Callable[[EmailMessage], Awaitable[Any]]
-SMTPAuthHandler = Callable[[SMTP, str, Any], Awaitable[AuthResult]] # the second parameter is method, the third is the data.
-# As method "login", "plain", the data is a `LoginPassword`
-
-class EmailQueue(Protocol):
-    def get(self) -> Awaitable[Tuple[EmailMessage, int]]:
-        ...
-
-    def remove(self, index: int) -> Awaitable[None]:
-        ...
-
-    def put(self, email: EmailMessage) -> Awaitable[None]:
-        ...
-
-
-@dataclass
-class DeliveryTask(object):
-    message_id: str
-    delivering_address: str
-    done: bool
-    success: bool
-    status_message: Optional[str] = None
-    tried: int = 0
-
-
-class _SMTPDHandler(AsyncMessage):  # TODO: support OAuth2
-    __logger = logging.getLogger("mailboat.mta._SMTPDHandler")
-
-    def __init__(
-        self,
-        message_handler: Callable[[EmailMessage], Awaitable[Any]],
-        smtp_auth_handler: SMTPAuthHandler,
-    ) -> None:
-        self.smtp_auth_handler = smtp_auth_handler
-        self.message_handler = message_handler
-        self.delivery_tasks: List[DeliveryTask] = []
-        super().__init__()
-
-    async def auth_LOGIN(self, server: SMTP, args: List[str]) -> AuthResult:
-        username = await server.challenge_auth("Username:")
-        if username == aiosmtpd.smtp.MISSING:
-            return AuthResult(success=False, handled=False)
-        else:
-            username = standard_b64decode(cast(bytes, username))
-        password = await server.challenge_auth("Password:")
-        if password == aiosmtpd.smtp.MISSING:
-            return AuthResult(success=False, handled=False)
-        else:
-            password = standard_b64decode(cast(bytes, password))
-        return await self.smtp_auth_handler(
-            server, "login", LoginPassword(cast(bytes, username), cast(bytes, password))
-        )
-
-    async def auth_PLAIN(self, server: SMTP, args: List[str]) -> AuthResult:
-        words = await server.challenge_auth("", encode_to_b64=False)
-        if words == aiosmtpd.smtp.MISSING:
-            return AuthResult(success=False, handled=False)
-        decoded_words = standard_b64decode(cast(bytes, words))
-        parts = decoded_words.split(b"\0")
-        if parts:
-            if not parts[0]:
-                parts.pop(0)
-        if len(parts) != 2:
-            return AuthResult(success=False, handled=True)
-        return await self.smtp_auth_handler(
-            server, "plain", LoginPassword(parts[0], parts[1])
-        )
-
-    async def handle_message(self, message: EmailMessage):
-        await self.message_handler(message)
+from ..utils.perf import async_perf_point
+from .protocols import EmailQueue, LocalDeliveryHandler, SMTPAuthHandler
+from .smtp import SMTPDHandler
 
 
 class UnQLiteEmailMessageQueue(EmailQueue):
+    """An implementation of `protocols.EmailQueue` for unqlite's `unqlite.Collection`."""
+
     def __init__(self, coll: Collection) -> None:
         self._coll = coll
         self._coll.create()
@@ -113,7 +41,9 @@ class UnQLiteEmailMessageQueue(EmailQueue):
 
     async def get(self) -> Tuple[EmailMessage, int]:
         while len(self._ids) == 0:
-            await asyncio.sleep(0)  # TODO (rubicon): more effective way to block coroutine
+            await asyncio.sleep(
+                0
+            )  # TODO (rubicon): more effective way to block coroutine
         result = self._coll.fetch(self._ids.pop(0))
         doc_id: int = result["__id"]
         message: str = result["message"]
@@ -128,6 +58,8 @@ class UnQLiteEmailMessageQueue(EmailQueue):
 
 
 class MemoryEmailQueue(EmailQueue):
+    """An implementation of `protocols.EmailQueue` in memory."""
+
     def __init__(self) -> None:
         self.container: Dict[int, EmailMessage] = {}
         self.next_read_id = 0
@@ -157,7 +89,14 @@ class MemoryEmailQueue(EmailQueue):
 
 
 class TransferAgent(object):
-    # TODO (rubicon): TLS support
+    """The programic mail transfer agent.
+    .. TODO:: TLS support
+
+    Related:
+
+    - [aiosmtpd Documentation](https://aiosmtpd.readthedocs.io/en/latest/)
+    """
+
     __logger = logging.getLogger("mailboat.mta.TransferAgent")
 
     def __init__(
@@ -171,11 +110,30 @@ class TransferAgent(object):
         self_name: str = "mailboat.transfer_agent",
         smtpd_port: int = 8025,
         custom_queue: Optional[EmailQueue] = None,
+        auth_require_tls: bool = True,
     ) -> None:
         self.mydomains = mydomains
+        """`List[str]`. The domains which should be managed by this instance.
+
+        Related:
+
+        - `mailboat.Mailboat.mydomains`
+        """
         self.database = database
-        self.name = self_name
+        """`UnQLite`. The database instance.
+        .. TODO:: replace it with `mailboat.storagehub.StorageHub` or any other abstract layer.
+        """
+        self.self_name = self_name
+        """`str`. The name of this instance.
+        ..note:: It should be used as internal name. For example: name for thread pool executors.
+        """
         self.hostname = hostname
+        """`str`. The hostname of this instance.
+
+        Related:
+
+        - `mailboat.Mailboat.hostname`
+        """
         self.queue = (
             custom_queue
             if custom_queue
@@ -183,27 +141,76 @@ class TransferAgent(object):
                 database.collection("{}.queue".format(self_name))
             )
         )
-        self.delivery_tasks: List[DeliveryTask] = []
+        """`EmailQueue`.
+        The email queue used by this instance. It will be `UnQLiteEmailMessageQueue` if `None` passed in.
+        """
         self.smtpd_controller = Controller(
-            _SMTPDHandler(
+            SMTPDHandler(
                 self.handle_message,
                 smtp_auth_handler=smtpd_auth_handler,
             ),
             port=smtpd_port,
             hostname=hostname,
+            auth_require_tls=auth_require_tls,
         )
+        """`aiosmtpd.controller.Controller`. The controller for SMTP server.
+        """
+        self._auth_require_tls = auth_require_tls
         self.local_delivery_handler = local_delivery_handler
+        """The handler that do the local delivery process.
+
+        Related:
+
+        - `mailboat.Mailboat.handle_local_delivering`
+        """
         self._task_deliveryman = asyncio.ensure_future(self._cothread_deliveryman())
 
-    def destory(self):  # TODO (rubicon): provide method for graceful shutdown
+    def destory(self):
+        """Stop the controller and cancel the devlivery coroutine.
+
+        ..TODO:: provide method for graceful shutdown
+
+        Related:
+
+        - `TransferAgent.start`
+        """
         self.smtpd_controller.stop()
         self._task_deliveryman.cancel("transfer agent destory")
 
     def start(self):
+        """Start the controller.
+
+        ..TODO:: move the delivery coroutine creation into this method
+        """
         self.smtpd_controller.start()
+
+    @property
+    def smtpd_port(self) -> int:
+        """The smtp server port."""
+        return self.smtpd_controller.port
+
+    @property
+    def auth_require_tls(self) -> bool:
+        """If authentication requires TLS connection. It `True` by default.
+        If `False`, the authentication is allowed in non-TLS connection.
+
+        ..caution:: Don't disable in production.
+            It's an important security feature to prevent the leaking of user's self-identity.
+            Disable only when you could not continue because of it.
+        """
+        return self._auth_require_tls
 
     @async_perf_point("TransferAgent.handle_message")
     async def handle_message(self, message: EmailMessage, internal: bool = False):
+        """Handle an email message.
+
+        Typically it's used as callback for `smtp.SMTPDHandler`.
+
+        The peer checking will be skipped when `internal` is `True`.
+        The checking is for preventing any other machine use this instance as a jump for sending ad mails.
+
+        ..TODO:: verify spf and dkim before local delivery
+        """
         if "message-id" not in message:
             return
         mail_to: BaseHeader = message["To"]
@@ -219,9 +226,7 @@ class TransferAgent(object):
             for addr in list:
                 if addr.addr_type == "email":
                     if addr.hostname in self.mydomains:
-                        should_be_delivered_to.append(
-                            addr.address
-                        )  # TODO (rubicon): verify spf and dkim before local delivery
+                        should_be_delivered_to.append(addr.address)
                     elif (
                         isinstance(message["X-Peer"], str)
                         and (
@@ -245,6 +250,10 @@ class TransferAgent(object):
         )
 
     async def remote_deliver(self, message: EmailMessage):
+        """Do remote delivery on `message`.
+
+        Remote delivery is for the messages which should be sent to a domain which not in `TransferAgent.mydomains`.
+        """
         for k in ["X-Peer", "X-MailFrom", "X-RcptTo", "Delivered-To"]:
             if k in message:
                 del message[k]
@@ -261,6 +270,12 @@ class TransferAgent(object):
                 await aiosmtplib.send(message)
 
     async def _cothread_deliveryman(self):  # TODO (rubicon): custom "pipeline"
+        """The body of delivery coroutine.
+
+        This coroutine waits for every mail in `TransferAgent.queue` and use the correct delivery method on them by the "delivery-to" header.
+
+        ..TODO:: use a eventbus instead a list for delivery tasks
+        """
         __logger = self.__logger.getChild("deliveryman")
         while True:
             try:
@@ -270,47 +285,26 @@ class TransferAgent(object):
                         del message["bcc"]
                         message["bcc"] = message["delivered-to"]
                     delivered_to = address.parse(message["delivered-to"])
-                    delivery_task = DeliveryTask(
-                        message["message-id"],
-                        delivering_address=delivered_to.address,
-                        done=False,
-                        success=False,
-                    )
-                    self.delivery_tasks.append(
-                        delivery_task
-                    )
-                    # TODO (rubicon): use a eventbus instead a list for delivery tasks
                     if delivered_to.hostname in self.mydomains:
-                        fut = asyncio.ensure_future(
-                            self.local_delivery_handler(message)
-                        )
-
-                        @fut.add_done_callback
-                        def when_local_delivery_done(fut: Future):
-                            asyncio.ensure_future(self.queue.remove(index))
-                            delivery_task.done = True
-                            if not fut.exception():
-                                delivery_task.success = True
-                            else:
-                                delivery_task.success = False
-                                delivery_task.status_message = str(fut.exception())
-
+                        asyncio.ensure_future(self.local_delivery_handler(message))
                     else:
-                        fut = asyncio.ensure_future(self.remote_deliver(message))
-
-                        @fut.add_done_callback
-                        def when_remote_delivery_done(fut: Future):
-                            asyncio.ensure_future(self.queue.remove(index))
-                            delivery_task.done = True
-                            if not fut.exception():
-                                delivery_task.success = True
-                            else:
-                                delivery_task.success = False
-                                delivery_task.status_message = str(fut.exception())
+                        asyncio.ensure_future(self.remote_deliver(message))
 
             except Exception as e:
                 __logger.exception(exc_info=e)
 
 
 async def smtpd_auth_rejectall(*args, **kargs):
+    """A `protocols.SMTPAuthHandler` rejects all requests.
+
+    Typically used as an argument to `TransferAgent`:
+
+    ````python
+    TransferAgent(
+        # ...
+        smtpd_auth_handler=smtpd_auth_rejectall,
+        # ...
+    )
+    ````
+    """
     return AuthResult(success=False, handled=True)

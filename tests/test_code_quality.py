@@ -14,17 +14,11 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with Mailboat.  If not, see <http://www.gnu.org/licenses/>.
+import subprocess
 
-"""The user system for Mailboat.
 
-User system process all the things about users:
-
-- User and Profile
-- Authentication
-- Mailboxes
-
-## User and Profile: The differences
-Mailboat defines two structures for user infomation: `usr.UserRecord` and `usr.ProfileRecord`.
-`usr.UserRecord` stores infomation which about the "User", which is about mailboat's daily running: username, password...
-`usr.ProfileRecord` stores infomation about people: public name, age, sex...
-"""
+def test_code_is_formatted():
+    result = subprocess.run(
+        ("poetry", "run", "black", "--check", "mailboat/", "tests/")
+    )
+    assert result.returncode == 0, "the code should be formatted"
